@@ -1,4 +1,5 @@
 import os
+import signal
 import logging
 
 from common import middleware, message_protocol, fruit_item
@@ -22,15 +23,61 @@ class JoinFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
+        self.sessions = {}
 
-    def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
+    def _get_session(self, client_id):
+        if client_id not in self.sessions:
+            self.sessions[client_id] = {"items": {}, "received": 0}
+        return self.sessions[client_id]
+
+    def _handle_agg_top(self, msg):
+        cid = msg["client_id"]
+        session = self._get_session(cid)
+        for fruit, amount in msg["top"]:
+            session["items"][fruit] = session["items"].get(
+                fruit, fruit_item.FruitItem(fruit, 0)
+            ) + fruit_item.FruitItem(fruit, int(amount))
+        session["received"] += 1
+        if session["received"] < AGGREGATION_AMOUNT:
+            return
+
+        sorted_items = sorted(session["items"].values())
+        top_fruits = reversed(sorted_items[-TOP_SIZE:])
+        top = []
+        for fruit_chunk in top_fruits:
+            top.append([fruit_chunk.fruit, fruit_chunk.amount])
+
+        self.output_queue.send(
+            message_protocol.internal.serialize(
+                {
+                    "kind": "final_top",
+                    "client_id": cid,
+                    "top": top,
+                }
+            )
+        )
+        logging.info(f"final_top | cid={cid} | top={top}")
+        del self.sessions[cid]
+
+    def _process_message(self, message, ack, nack):
+        msg = message_protocol.internal.deserialize(message)
+        kind = msg.get("kind")
+        if kind == "agg_top":
+            self._handle_agg_top(msg)
+        else:
+            logging.warning(f"join | unknown kind={kind}")
         ack()
 
     def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        try:
+            self.input_queue.start_consuming(self._process_message)
+        finally:
+            self.input_queue.close()
+            self.output_queue.close()
+
+    def _handle_sigterm(self, signum, frame):
+        self.input_queue.stop_consuming()
 
 
 def main():
