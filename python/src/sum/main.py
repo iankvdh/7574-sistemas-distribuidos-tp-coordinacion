@@ -26,7 +26,6 @@ class SumFilter:
             MOM_HOST, INPUT_QUEUE
         )
         self.aggregator_queues = []
-        self.ring_queues = []
 
         for i in range(AGGREGATION_AMOUNT):
             self.aggregator_queues.append(
@@ -34,16 +33,13 @@ class SumFilter:
                     MOM_HOST, f"{AGGREGATION_PREFIX}_{i}"
                 )
             )
-
         for i in range(SUM_AMOUNT):
-            self.ring_queues.append(
-                middleware.MessageMiddlewareQueueRabbitMQ(
-                    MOM_HOST, f"{SUM_PREFIX}_ring_{i}"
-                )
-            )
+            self.input_queue.declare_queue(f"{SUM_PREFIX}_ring_{i}")
 
         self._ring_inbox_name = f"{SUM_PREFIX}_ring_{ID}"
-        self.next_ring_queue = self.ring_queues[(ID + 1) % SUM_AMOUNT]
+        self.next_ring_queue = middleware.MessageMiddlewareQueueRabbitMQ(
+            MOM_HOST, f"{SUM_PREFIX}_ring_{(ID + 1) % SUM_AMOUNT}"
+        )
         self.sessions = {}
 
     def _get_session(self, client_id):
@@ -206,8 +202,7 @@ class SumFilter:
             self.input_queue.close()
             for q in self.aggregator_queues:
                 q.close()
-            for q in self.ring_queues:
-                q.close()
+            self.next_ring_queue.close()
 
     def _handle_sigterm(self, signum, frame):
         self.input_queue.stop_consuming()

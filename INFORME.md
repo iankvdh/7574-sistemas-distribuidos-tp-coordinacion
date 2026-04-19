@@ -14,6 +14,19 @@
 
 ---
 
+## Visión general de la solución
+
+Para resolver los tres problemas centrales del TP:
+
+- **Múltiples clientes concurrentes**: cada mensaje lleva un `client_id` único generado por el gateway. Todos los componentes mantienen estado separado por cliente y nunca mezclan sesiones.
+
+- **Coordinación de EOF entre réplicas de Sum**: el gateway cuenta exactamente cuántos mensajes `data` envió (`total_messages`) e incluye ese número en el `eof`. Las réplicas de Sum usan un **anillo de conteo**: la que recibe el `eof` circula un token sumando los counts de cada nodo; cuando la suma iguala `total_messages`, todas flushean. Si no alcanza, se reintenta.
+
+- **Distribución de carga hacia Aggregation**: Sum hace sharding determinístico por fruta (`zlib.crc32 % AGGREGATION_AMOUNT`), de modo que cada fruta siempre va al mismo Aggregator. Esto evita broadcast y procesamiento redundante.
+
+
+---
+
 ## 1. Supuestos
 
 El diseño parte de los siguientes supuestos:
@@ -101,7 +114,7 @@ Cada Sum_i tiene:
 - `_ring_inbox_name` = `{SUM_PREFIX}_ring_{ID}`: su buzón de entrada; Sum_{i-1} le escribe aquí.
 - `next_ring_queue` = `{SUM_PREFIX}_ring_{(ID+1) % SUM_AMOUNT}`: el buzón del siguiente; Sum_i escribe aquí.
 
-**Pre-declaración al arranque**: al inicializarse, cada Sum declara las `SUM_AMOUNT` colas del ring (no solo la propia). Esto garantiza que si Sum_i envía un `ring_token` antes de que Sum_{i+1} haya arrancado, la cola ya existe en RabbitMQ y el mensaje no se pierde.
+**Pre-declaración al arranque**: al inicializarse, cada Sum declara las `SUM_AMOUNT` colas del ring (no solo la propia) via `input_queue.declare_queue(...)`, reutilizando el channel ya abierto de INPUT_QUEUE. De este modo no se abren conexiones adicionales solo para declarar: la única conexión extra del ring es `next_ring_queue` (para publicar al nodo siguiente). Esto garantiza que si Sum_i envía un `ring_token` antes de que Sum_{i+1} haya arrancado, la cola ya existe en RabbitMQ y el mensaje no se pierde.
 
 ### Consumo de dos colas en un solo thread
 
@@ -130,7 +143,7 @@ El mensaje `sum_done` se envía a **todos** los aggregators, para que cada uno s
 El handler de SIGTERM llama a `input_queue.stop_consuming()`, que detiene el event loop de pika (incluyendo el consumer del ring, ya que comparten channel). `start_consuming()` retorna y el bloque `finally` cierra todas las conexiones abiertas:
 - `input_queue`: la conexión de INPUT_QUEUE (que también hostea el consumer del ring inbox).
 - `aggregator_queues[i]`: una conexión por cada aggregator (usadas para publicar `sum_partial` y `sum_done`).
-- `ring_queues[i]`: una conexión por cada nodo del ring. Se crean `SUM_AMOUNT` objetos al arrancar para declarar todas las colas; aunque Solo `next_ring_queue` se usa para publicar, todas tienen una `BlockingConnection` abierta y necesitan `close()`.
+- `next_ring_queue`: conexión de ring, usada para publicar al nodo siguiente. Las demás ring queues se declararon en el channel de `input_queue` sin abrir conexiones propias.
 
 ---
 

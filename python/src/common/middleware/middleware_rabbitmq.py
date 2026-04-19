@@ -72,6 +72,14 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         except Exception as e:
             raise MessageMiddlewareMessageError(f"Error al enviar mensaje: {e}") from e
 
+    def declare_queue(self, queue_name):
+        try:
+            self._channel.queue_declare(queue=queue_name, durable=True)
+        except Exception as e:
+            raise MessageMiddlewareMessageError(
+                f"Error al declarar cola {queue_name}: {e}"
+            ) from e
+
     def add_queue_consumer(self, queue_name, on_message_callback):
         self._channel.queue_declare(queue=queue_name, durable=True)
         self._extra_consumers.append((queue_name, on_message_callback))
