@@ -26,23 +26,40 @@ class SumFilter:
             MOM_HOST, INPUT_QUEUE
         )
         self.aggregator_queues = []
+        self.ring_queues = []
 
         for i in range(AGGREGATION_AMOUNT):
-            data_output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-                MOM_HOST, f"{AGGREGATION_PREFIX}_{i}"
+            self.aggregator_queues.append(
+                middleware.MessageMiddlewareQueueRabbitMQ(
+                    MOM_HOST, f"{AGGREGATION_PREFIX}_{i}"
+                )
             )
-            self.aggregator_queues.append(data_output_queue)
+
+        for i in range(SUM_AMOUNT):
+            self.ring_queues.append(
+                middleware.MessageMiddlewareQueueRabbitMQ(
+                    MOM_HOST, f"{SUM_PREFIX}_ring_{i}"
+                )
+            )
+
+        self.next_ring_queue = self.ring_queues[(ID + 1) % SUM_AMOUNT]
         self.sessions = {}
 
     def _get_session(self, client_id):
         if client_id not in self.sessions:
-            self.sessions[client_id] = {"partial_by_fruit": {}}
+            self.sessions[client_id] = {
+                "partial_by_fruit": {},
+                "count": 0,
+                "is_leader": False,
+                "total_messages": None,
+            }
         return self.sessions[client_id]
 
     def _handle_data(self, msg):
         cid = msg["client_id"]
         fruit = msg["fruit"]
         session = self._get_session(cid)
+        session["count"] += 1
         session["partial_by_fruit"][fruit] = session["partial_by_fruit"].get(
             fruit, fruit_item.FruitItem(fruit, 0)
         ) + fruit_item.FruitItem(fruit, int(msg["amount"]))
@@ -50,9 +67,74 @@ class SumFilter:
     def _handle_eof(self, msg):
         cid = msg["client_id"]
         session = self._get_session(cid)
+        session["is_leader"] = True
+        session["total_messages"] = msg["total_messages"]
+        self.next_ring_queue.send(
+            message_protocol.internal.serialize(
+                {
+                    "kind": "ring_token",
+                    "client_id": cid,
+                    "accumulated_count": session["count"],
+                }
+            )
+        )
+        logging.info(
+            f"ring_token sent | cid=%s | sum_id=%d | count=%d",
+            cid,
+            ID,
+            session["count"],
+        )
+
+    def _handle_ring_token(self, msg):
+        cid = msg["client_id"]
+        session = self._get_session(cid)
+        accumulated = msg["accumulated_count"]
+        if not session["is_leader"]:
+            self.next_ring_queue.send(
+                message_protocol.internal.serialize(
+                    {
+                        "kind": "ring_token",
+                        "client_id": cid,
+                        "accumulated_count": accumulated + session["count"],
+                    }
+                )
+            )
+            return
+
+        # soy el lider
+        total = accumulated
+        if total == session["total_messages"]:
+            self.next_ring_queue.send(
+                message_protocol.internal.serialize(
+                    {
+                        "kind": "ring_finish",
+                        "client_id": cid,
+                    }
+                )
+            )
+            logging.info(
+                f"ring_finish sent | cid=%s | sum_id=%d | total=%d", cid, ID, total
+            )
+        else:
+            total_messages = session["total_messages"]
+            session["is_leader"] = False
+            session["total_messages"] = None
+            self.input_queue.send(
+                message_protocol.internal.serialize(
+                    {
+                        "kind": "eof",
+                        "client_id": cid,
+                        "total_messages": total_messages,
+                    }
+                )
+            )
+            logging.info(f"ring retry | cid=%s | sum_id=%d | got=%d", cid, ID, total)
+
+    def _flush(self, cid):
+        session = self.sessions[cid]
         for final_fruit_item in session["partial_by_fruit"].values():
-            agregator_id = _aggregator_id(final_fruit_item.fruit)
-            self.aggregator_queues[agregator_id].send(
+            aggregator_id = _aggregator_id(final_fruit_item.fruit)
+            self.aggregator_queues[aggregator_id].send(
                 message_protocol.internal.serialize(
                     {
                         "kind": "sum_partial",
@@ -76,6 +158,20 @@ class SumFilter:
         )
         del self.sessions[cid]
 
+    def _handle_ring_finish(self, msg):
+        cid = msg["client_id"]
+        session = self._get_session(cid)
+        self._flush(cid)
+        if not session.get("is_leader", False):
+            self.next_ring_queue.send(
+                message_protocol.internal.serialize(
+                    {
+                        "kind": "ring_finish",
+                        "client_id": cid,
+                    }
+                )
+            )
+
     def _process_message(self, message, ack, nack):
         msg = message_protocol.internal.deserialize(message)
         kind = msg.get("kind")
@@ -84,16 +180,32 @@ class SumFilter:
         elif kind == "eof":
             self._handle_eof(msg)
         else:
-            logging.warning("sum | unknown kind=%s", kind)
+            logging.warning(f"sum | unexpected kind on INPUT_QUEUE: {kind}")
+        ack()
+
+    def _process_ring_message(self, message, ack, nack):
+        msg = message_protocol.internal.deserialize(message)
+        kind = msg.get("kind")
+        if kind == "ring_token":
+            self._handle_ring_token(msg)
+        elif kind == "ring_finish":
+            self._handle_ring_finish(msg)
+        else:
+            logging.warning(f"sum | unexpected kind on ring queue: {kind}")
         ack()
 
     def start(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
+        self.input_queue.add_queue_consumer(
+            f"{SUM_PREFIX}_ring_{ID}", self._process_ring_message
+        )
         try:
             self.input_queue.start_consuming(self._process_message)
         finally:
             self.input_queue.close()
             for q in self.aggregator_queues:
+                q.close()
+            for q in self.ring_queues:
                 q.close()
 
     def _handle_sigterm(self, signum, frame):

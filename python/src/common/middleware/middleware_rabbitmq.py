@@ -14,6 +14,7 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         self._queue_name = queue_name
         self._connection = None
         self._channel = None
+        self._extra_consumers = []
         try:
             self._connection = pika.BlockingConnection(
                 pika.ConnectionParameters(host=host)
@@ -54,21 +55,33 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         except Exception as e:
             raise MessageMiddlewareMessageError(f"Error al enviar mensaje: {e}") from e
 
+    def add_queue_consumer(self, queue_name, on_message_callback):
+        self._channel.queue_declare(queue=queue_name, durable=True)
+        self._extra_consumers.append((queue_name, on_message_callback))
+
     def start_consuming(self, on_message_callback):
-        def callback_wrapper(ch, method, properties, body):
-            def ack():
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+        def make_wrapper(cb):
+            def wrapper(ch, method, properties, body):
+                def ack():
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
 
-            def nack():
-                ch.basic_nack(delivery_tag=method.delivery_tag)
+                def nack():
+                    ch.basic_nack(delivery_tag=method.delivery_tag)
 
-            on_message_callback(body, ack, nack)
+                cb(body, ack, nack)
+
+            return wrapper
 
         try:
             self._channel.basic_qos(prefetch_count=1)
             self._channel.basic_consume(
-                queue=self._queue_name, on_message_callback=callback_wrapper
+                queue=self._queue_name,
+                on_message_callback=make_wrapper(on_message_callback),
             )
+            for extra_queue, extra_cb in self._extra_consumers:
+                self._channel.basic_consume(
+                    queue=extra_queue, on_message_callback=make_wrapper(extra_cb)
+                )
             self._channel.start_consuming()
         except (
             pika.exceptions.AMQPConnectionError,
