@@ -97,7 +97,8 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             )
             for extra_queue, extra_cb in self._extra_consumers:
                 self._channel.basic_consume(
-                    queue=extra_queue, on_message_callback=make_wrapper(extra_cb)
+                    queue=extra_queue, 
+                    on_message_callback=make_wrapper(extra_cb)
                 )
             self._channel.start_consuming()
         except (

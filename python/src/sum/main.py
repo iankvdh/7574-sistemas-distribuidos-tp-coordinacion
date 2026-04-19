@@ -42,6 +42,7 @@ class SumFilter:
                 )
             )
 
+        self._ring_inbox_name = f"{SUM_PREFIX}_ring_{ID}"
         self.next_ring_queue = self.ring_queues[(ID + 1) % SUM_AMOUNT]
         self.sessions = {}
 
@@ -110,7 +111,7 @@ class SumFilter:
                 )
             )
             logging.info(f"ring_finish init | cid={cid} | sum_id={ID} | total={total}")
-        else:
+        elif total < session["total_messages"]:
             total_messages = session["total_messages"]
             session["is_leader"] = False
             session["total_messages"] = None
@@ -124,6 +125,11 @@ class SumFilter:
                 )
             )
             logging.info(f"ring retry | cid={cid} | sum_id={ID} | got={total}")
+        else:
+            logging.error(f"ring invariant violated | cid={cid} | sum_id={ID} | got={total} > expected={session['total_messages']}")
+            raise RuntimeError(
+                f"ring invariant violated: accumulated {total} > total_messages {session['total_messages']}"
+            )
 
     def _flush(self, cid):
         session = self.sessions[cid]
@@ -191,10 +197,10 @@ class SumFilter:
 
     def start(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
-        self.input_queue.add_queue_consumer(
-            f"{SUM_PREFIX}_ring_{ID}", self._process_ring_message
-        )
         try:
+            self.input_queue.add_queue_consumer(
+                self._ring_inbox_name, self._process_ring_message
+            )
             self.input_queue.start_consuming(self._process_message)
         finally:
             self.input_queue.close()
