@@ -1,3 +1,5 @@
+import os
+import time
 import pika
 from .middleware import (
     MessageMiddlewareCloseError,
@@ -6,6 +8,21 @@ from .middleware import (
     MessageMiddlewareQueue,
     MessageMiddlewareExchange,
 )
+
+_MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "10"))
+_RETRY_DELAY = 2
+
+
+def _connect_with_retry(host):
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            return pika.BlockingConnection(pika.ConnectionParameters(host=host))
+        except pika.exceptions.AMQPConnectionError:
+            if attempt < _MAX_ATTEMPTS - 1:
+                time.sleep(_RETRY_DELAY)
+    raise MessageMiddlewareDisconnectedError(
+        f"No se pudo conectar a RabbitMQ en {host} tras {_MAX_ATTEMPTS} intentos"
+    )
 
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
@@ -16,9 +33,7 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
         self._channel = None
         self._extra_consumers = []
         try:
-            self._connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=host)
-            )
+            self._connection = _connect_with_retry(host)
             self._channel = self._connection.channel()
             self._channel.queue_declare(queue=self._queue_name, durable=True)
         except Exception as e:
@@ -114,9 +129,7 @@ class MessageMiddlewareExchangeRabbitMQ(MessageMiddlewareExchange):
         self._connection = None
         self._channel = None
         try:
-            self._connection = pika.BlockingConnection(
-                pika.ConnectionParameters(host=host)
-            )
+            self._connection = _connect_with_retry(host)
             self._channel = self._connection.channel()
             self._channel.exchange_declare(
                 exchange=self._exchange_name,
