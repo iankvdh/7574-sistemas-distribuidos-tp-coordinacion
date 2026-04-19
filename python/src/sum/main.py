@@ -79,10 +79,7 @@ class SumFilter:
             )
         )
         logging.info(
-            f"ring_token sent | cid=%s | sum_id=%d | count=%d",
-            cid,
-            ID,
-            session["count"],
+            f"ring_token init | cid={cid} | sum_id={ID} | count={session['count']}"
         )
 
     def _handle_ring_token(self, msg):
@@ -112,9 +109,7 @@ class SumFilter:
                     }
                 )
             )
-            logging.info(
-                f"ring_finish sent | cid=%s | sum_id=%d | total=%d", cid, ID, total
-            )
+            logging.info(f"ring_finish init | cid={cid} | sum_id={ID} | total={total}")
         else:
             total_messages = session["total_messages"]
             session["is_leader"] = False
@@ -128,7 +123,7 @@ class SumFilter:
                     }
                 )
             )
-            logging.info(f"ring retry | cid=%s | sum_id=%d | got=%d", cid, ID, total)
+            logging.info(f"ring retry | cid={cid} | sum_id={ID} | got={total}")
 
     def _flush(self, cid):
         session = self.sessions[cid]
@@ -160,9 +155,9 @@ class SumFilter:
 
     def _handle_ring_finish(self, msg):
         cid = msg["client_id"]
-        session = self._get_session(cid)
+        is_leader = self._get_session(cid).get("is_leader", False)
         self._flush(cid)
-        if not session.get("is_leader", False):
+        if not is_leader:
             self.next_ring_queue.send(
                 message_protocol.internal.serialize(
                     {

@@ -10,7 +10,8 @@ from .middleware import (
 )
 
 _MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "10"))
-_RETRY_DELAY = 2
+_RETRY_BASE_DELAY = 1
+_RETRY_MAX_DELAY = 30
 
 
 def _connect_with_retry(host):
@@ -19,7 +20,8 @@ def _connect_with_retry(host):
             return pika.BlockingConnection(pika.ConnectionParameters(host=host))
         except pika.exceptions.AMQPConnectionError:
             if attempt < _MAX_ATTEMPTS - 1:
-                time.sleep(_RETRY_DELAY)
+                delay = min(_RETRY_BASE_DELAY * (2**attempt), _RETRY_MAX_DELAY)
+                time.sleep(delay)
     raise MessageMiddlewareDisconnectedError(
         f"No se pudo conectar a RabbitMQ en {host} tras {_MAX_ATTEMPTS} intentos"
     )
