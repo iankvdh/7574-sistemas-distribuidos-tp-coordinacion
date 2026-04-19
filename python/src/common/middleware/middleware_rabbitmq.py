@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import pika
@@ -42,7 +43,7 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             try:
                 self.close()
             except Exception as close_error:
-                print(f"Aviso: Error durante la limpieza post-fallo: {close_error}")
+                logging.warning(f"Error durante la limpieza post-fallo: {close_error}")
             raise MessageMiddlewareMessageError(
                 f"Error al inicializar la cola: {e}"
             ) from e
