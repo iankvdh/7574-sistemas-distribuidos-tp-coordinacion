@@ -14,6 +14,8 @@ SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
 AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
+Kind = message_protocol.internal.Kind
+
 
 def _aggregator_id(fruit):
     return zlib.crc32(fruit.encode("utf-8")) % AGGREGATION_AMOUNT
@@ -69,7 +71,7 @@ class SumFilter:
         self.next_ring_queue.send(
             message_protocol.internal.serialize(
                 {
-                    "kind": "ring_token",
+                    "kind": Kind.RING_TOKEN,
                     "client_id": cid,
                     "accumulated_count": session["count"],
                 }
@@ -87,7 +89,7 @@ class SumFilter:
             self.next_ring_queue.send(
                 message_protocol.internal.serialize(
                     {
-                        "kind": "ring_token",
+                        "kind": Kind.RING_TOKEN,
                         "client_id": cid,
                         "accumulated_count": accumulated + session["count"],
                     }
@@ -95,13 +97,12 @@ class SumFilter:
             )
             return
 
-        # soy el lider
         total = accumulated
         if total == session["total_messages"]:
             self.next_ring_queue.send(
                 message_protocol.internal.serialize(
                     {
-                        "kind": "ring_finish",
+                        "kind": Kind.RING_FINISH,
                         "client_id": cid,
                     }
                 )
@@ -114,7 +115,7 @@ class SumFilter:
             self.input_queue.send(
                 message_protocol.internal.serialize(
                     {
-                        "kind": "eof",
+                        "kind": Kind.EOF,
                         "client_id": cid,
                         "total_messages": total_messages,
                     }
@@ -134,7 +135,7 @@ class SumFilter:
             self.aggregator_queues[aggregator_id].send(
                 message_protocol.internal.serialize(
                     {
-                        "kind": "sum_partial",
+                        "kind": Kind.SUM_PARTIAL,
                         "client_id": cid,
                         "fruit": final_fruit_item.fruit,
                         "amount": final_fruit_item.amount,
@@ -143,7 +144,7 @@ class SumFilter:
             )
         done_msg = message_protocol.internal.serialize(
             {
-                "kind": "sum_done",
+                "kind": Kind.SUM_DONE,
                 "client_id": cid,
                 "src_id": ID,
             }
@@ -163,7 +164,7 @@ class SumFilter:
             self.next_ring_queue.send(
                 message_protocol.internal.serialize(
                     {
-                        "kind": "ring_finish",
+                        "kind": Kind.RING_FINISH,
                         "client_id": cid,
                     }
                 )
@@ -172,9 +173,9 @@ class SumFilter:
     def _process_message(self, message, ack, nack):
         msg = message_protocol.internal.deserialize(message)
         kind = msg.get("kind")
-        if kind == "data":
+        if kind == Kind.DATA:
             self._handle_data(msg)
-        elif kind == "eof":
+        elif kind == Kind.EOF:
             self._handle_eof(msg)
         else:
             logging.warning(f"sum | unexpected kind on INPUT_QUEUE: {kind}")
@@ -183,9 +184,9 @@ class SumFilter:
     def _process_ring_message(self, message, ack, nack):
         msg = message_protocol.internal.deserialize(message)
         kind = msg.get("kind")
-        if kind == "ring_token":
+        if kind == Kind.RING_TOKEN:
             self._handle_ring_token(msg)
-        elif kind == "ring_finish":
+        elif kind == Kind.RING_FINISH:
             self._handle_ring_finish(msg)
         else:
             logging.warning(f"sum | unexpected kind on ring queue: {kind}")

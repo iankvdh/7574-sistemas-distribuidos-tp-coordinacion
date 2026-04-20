@@ -5,6 +5,7 @@ import logging
 from common import middleware, message_protocol, fruit_item
 
 ID = int(os.environ["ID"])
+Kind = message_protocol.internal.Kind
 MOM_HOST = os.environ["MOM_HOST"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
@@ -55,7 +56,7 @@ class AggregationFilter:
         self.output_queue.send(
             message_protocol.internal.serialize(
                 {
-                    "kind": "agg_top",
+                    "kind": Kind.AGG_TOP,
                     "client_id": cid,
                     "src_id": ID,
                     "top": top,
@@ -68,9 +69,9 @@ class AggregationFilter:
     def _process_message(self, message, ack, nack):
         msg = message_protocol.internal.deserialize(message)
         kind = msg.get("kind")
-        if kind == "sum_partial":
+        if kind == Kind.SUM_PARTIAL:
             self._handle_sum_partial(msg)
-        elif kind == "sum_done":
+        elif kind == Kind.SUM_DONE:
             self._handle_sum_done(msg)
         else:
             logging.warning("aggregation | unknown kind=%s", kind)

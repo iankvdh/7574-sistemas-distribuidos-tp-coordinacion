@@ -5,6 +5,7 @@ import logging
 from common import middleware, message_protocol, fruit_item
 
 MOM_HOST = os.environ["MOM_HOST"]
+Kind = message_protocol.internal.Kind
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
@@ -50,7 +51,7 @@ class JoinFilter:
         self.output_queue.send(
             message_protocol.internal.serialize(
                 {
-                    "kind": "final_top",
+                    "kind": Kind.FINAL_TOP,
                     "client_id": cid,
                     "top": top,
                 }
@@ -62,7 +63,7 @@ class JoinFilter:
     def _process_message(self, message, ack, nack):
         msg = message_protocol.internal.deserialize(message)
         kind = msg.get("kind")
-        if kind == "agg_top":
+        if kind == Kind.AGG_TOP:
             self._handle_agg_top(msg)
         else:
             logging.warning(f"join | unknown kind={kind}")

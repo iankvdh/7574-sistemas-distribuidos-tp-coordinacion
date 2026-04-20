@@ -15,6 +15,20 @@
 
 ---
 
+## Índice
+
+1. [Supuestos](#1-supuestos)
+2. [Protocolo interno de mensajes](#2-protocolo-interno-de-mensajes)
+3. [Middleware](#3-middleware)
+4. [Gateway y `message_handler`](#4-gateway-y-message_handler)
+5. [Sum](#5-sum)
+6. [Aggregation](#6-aggregation)
+7. [Join](#7-join)
+8. [Escalabilidad](#8-escalabilidad)
+9. [Alternativas de coordinación consideradas](#9-alternativas-de-coordinación-consideradas)
+
+---
+
 ## Visión general de la solución
 
 Para resolver los tres problemas centrales del TP:
@@ -44,9 +58,25 @@ Bajo estos supuestos no hay doble conteo, no hay flushes incompletos y no se nec
 
 ## 2. Protocolo interno de mensajes
 
-- Todos los mensajes internos son JSON codificado en UTF-8, con un campo `kind` que identifica el tipo.
+Todos los mensajes internos son JSON codificado en UTF-8. Cada mensaje lleva obligatoriamente los campos `kind` (identifica el tipo, definido en `message_protocol.internal.Kind`) y `client_id` (permite que múltiples clientes coexistan sin mezclar estado).
 
-- Cada mensaje lleva un campo `client_id` que permite que múltiples clientes coexistan sin mezclar estado.
+Los tipos de mensajes y sus campos adicionales son:
+
+| `kind` | Emisor | Cola destino | Receptor | Campos adicionales |
+|---|---|---|---|---|
+| `data` | Gateway | `INPUT_QUEUE` | Sum | `fruit: str`, `amount: int` |
+| `eof` | Gateway / Sum (retry) | `INPUT_QUEUE` | Sum | `total_messages: int` |
+| `ring_token` | Sum (líder o no-líder) | `{SUM_PREFIX}_ring_{i+1}` | Sum siguiente | `accumulated_count: int` |
+| `ring_finish` | Sum (líder lo inicia; cada no-líder lo reenvía) | `{SUM_PREFIX}_ring_{i+1}` | Sum siguiente | — |
+| `sum_partial` | Sum | `{AGGREGATION_PREFIX}_{i}` | Aggregation_i | `fruit: str`, `amount: int` |
+| `sum_done` | Sum | `{AGGREGATION_PREFIX}_{i}` (todos) | Todas las Aggregation | `src_id: int` |
+| `agg_top` | Aggregation | `join_queue` | Join | `src_id: int`, `top: [[str, int]]` |
+| `final_top` | Join | `RESULTS_QUEUE` | Gateway | `top: [[str, int]]` |
+
+**Notas de diseño:**
+- `eof` puede ser re-encolado por el propio Sum líder cuando el anillo detecta que no todos los datos fueron procesados (ver Sección 5). En ese caso el emisor es Sum, no Gateway, pero el campo `total_messages` es el mismo valor original.
+- `sum_partial` va a una sola Aggregation (la que corresponde por sharding); `sum_done` va a **todas**.
+- `ring_finish` recorre todo el anillo: el líder lo inicia, cada no-líder hace flush y lo reenvía al siguiente, y el líder (que lo recibe último) hace flush pero no lo reenvía. No lleva campos adicionales; el `client_id` es suficiente para identificar la sesión.
 
 ---
 
