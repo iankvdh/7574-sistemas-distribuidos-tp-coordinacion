@@ -242,7 +242,36 @@ Agregar más instancias de Aggregation reduce la cantidad de frutas que procesa 
 
 ## 9. Alternativas de coordinación consideradas
 
-> *Esta sección documenta otras aproximaciones que consideré para resolver la coordinación del EOF entre instancias de Sum, con sus ventajas y desventajas.*
+### 1. Reencolado de SUM_AMOUNT copias del EOF
+
+La idea era reencolar tantas copias del `eof` como instancias de Sum hay en `INPUT_QUEUE`, apostando a que el round-robin de RabbitMQ distribuya exactamente una copia a cada instancia.
+
+**Problema fundamental**: RabbitMQ no garantiza round-robin estricto. El reparto depende del prefetch, la velocidad de ACK y el estado interno del broker. Con carga despareja, una instancia podría recibir dos copias y otra ninguna. El protocolo no tendría forma de detectarlo: dos flushes desde la misma instancia generarían doble conteo en Aggregation, y la instancia que no recibió el EOF nunca flushearía. El esquema falla de forma silenciosa y no determinística.
+
+
+### 2. Canal compartido con `global=True` + fanout de EOF
+
+Cada Sum consume de dos colas en el mismo canal: `INPUT_QUEUE` (datos y `eof_request`) y una cola personal durable bindeada a un fanout exchange de control (`{SUM_PREFIX}_eof_{ID}`). El canal se configura con `basic_qos(prefetch_count=1, global_qos=True)`, que da **1 crédito total al canal** en lugar de 1 por consumer (por instancia de Sum).
+
+La garantía clave es causal: el gateway publica datos y luego `eof_request` en orden FIFO. La Sum que desencola `eof_request` sabe que todos los datos ya salieron de `INPUT_QUEUE` — están siendo procesados por alguna réplica. En ese momento publica `eof_control` al fanout exchange, que lo entrega simultáneamente a las `N` colas personales. Gracias a `global_qos=True`, ninguna réplica puede recibir `eof_control` mientras tiene un mensaje de datos sin ACKear: el crédito del canal está ocupado. Cuando llega `eof_control`, el estado parcial de esa réplica está completo y puede flushear directamente — **sin conteo distribuido**.
+
+**Por qué no la usé**: el protocolo es correcto y no compromete el throughput — cada Sum tiene su propia conexión y canal, por lo que `global_qos=True` serializa únicamente la alternancia entre los dos consumers *dentro de esa instancia*, no entre instancias. Las N réplicas siguen procesando en paralelo. La razón por la que no la elegí es que se apoya casi completamente en garantías del protocolo AMQP (`global_qos` + FIFO de cola) en lugar de coordinación explícita a nivel de aplicación, que es lo que el enunciado pide diseñar e implementar.
+
+### 3. Broadcast all-to-all de counts en lugar de anillo
+
+La variante mantiene el mismo mecanismo de conteo que la solución elegida, pero reemplaza el anillo por dos rondas de broadcast:
+
+1. La instancia que recibe el `eof` publica un mensaje de control con `total_messages` a **todas** las instancias (incluyéndose) vía fanout exchange.
+2. Cada instancia que recibe ese mensaje publica su propio `count` a todas las demás (también vía fanout o direct con N routing keys).
+3. Cada instancia acumula los N counts recibidos, suma, y compara contra `total_messages`. Si es igual, flushea; si es menor, el líder reencola el `eof`; si es mayor, error.
+
+**Por qué no la usé**: la lógica de decisión es equivalente al anillo — ambas son snapshots del conteo total en un instante dado, con el mismo mecanismo de retry. La diferencia está en el volumen de mensajes de coordinación: el anillo genera O(N) mensajes por vuelta (token + finish), este esquema genera O(N²) (cada una de las N instancias difunde su count a las otras N). Además requiere que cada instancia abra N conexiones de salida para el broadcast de counts, frente a la única conexión de ring del anillo. Para N pequeño la diferencia es irrelevante, pero el anillo es estrictamente más barato en mensajes y conexiones sin perder expresividad.
 
 
 
+
+### 4. Reencolado del EOF con conjunto de instancias visitadas
+
+La idea era incluir en el `eof` un conjunto de IDs de instancias que ya lo procesaron. Cada instancia que lo recibe agrega su propio ID y lo reencola en `INPUT_QUEUE`, a menos que el conjunto ya contenga todos los IDs. La instancia que cierra el conjunto sabe que es la última y no reencola.
+
+**Por qué no la usé**: `INPUT_QUEUE` es una work queue competitiva — RabbitMQ entrega el mensaje al primer consumer listo, sin garantía de equidad entre instancias. Una instancia rápida puede consumir el `eof` rereencolado repetidamente antes de que una instancia más lenta o ocupada tenga la oportunidad de verlo. Con N instancias, las mismas N-1 podrían consumir el `eof` en loop indefinidamente sin que la restante lo reciba nunca. El protocolo no tiene liveness garantizada.
