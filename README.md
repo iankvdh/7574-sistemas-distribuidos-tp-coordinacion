@@ -94,7 +94,7 @@ Elegí backoff exponencial sobre reintentos a intervalo fijo porque reduce la ca
 
 ### Durabilidad
 
-Todas las colas se declaran con `durable=True` y los mensajes se publican con `delivery_mode=2`. Esto garantiza que si RabbitMQ se reinicia, las colas y sus mensajes sobreviven. Bajo los supuestos del TP esto no debería ocurrir, pero lo mantuve porque no agrega complejidad de código ya que fue realizado para el TP anterior, aunque reconozco que no se aprovecha de la mejor forma en esta implementación.
+Todas las colas se declaran con `durable=True` y los mensajes se publican con `delivery_mode=2`. Esto garantiza que si RabbitMQ se reinicia, las colas y sus mensajes sobreviven. Bajo los supuestos del TP esto no debería ocurrir, pero lo mantuve porque no agrega complejidad de código ya que fue realizado para el TP anterior, aunque reconozco que no se aprovecha de la mejor forma en esta implementación. (En este TP el broker corre sin volumen persistente, por lo que si el contenedor se recrea el estado se pierde igualmente)
 
 No se usan **quorum queues**: son colas replicadas vía Raft que requieren un cluster de al menos 3 nodos de RabbitMQ para dar garantías reales. El sistema corre con un único nodo de RabbitMQ, por lo que en un nodo solo añadirían overhead de consenso sin ningún beneficio de replicación.
 
@@ -163,7 +163,9 @@ Si `add_queue_consumer` falla (por ejemplo, por un error AMQP al declarar la col
 
 Configuré `prefetch_count=1` **por consumer** (no global). Según la especificación AMQP y la documentación de RabbitMQ, con `global=False` (el default de pika), el límite de prefetch aplica de forma independiente a cada consumer del channel: RabbitMQ puede tener 1 mensaje sin ACK en vuelo para el consumer de INPUT_QUEUE **y** simultáneamente 1 mensaje sin ACK en vuelo para el consumer del ring.
 
-Esto garantiza **no-starvation**: el mensaje del ring está pre-entregado en el buffer del cliente incluso mientras se está procesando un mensaje de INPUT. Cuando el mensaje de INPUT es ACKeado, el evento del ring ya está disponible para procesar en el siguiente ciclo del event loop.
+Esto mitiga fuertemente el **starvation** del ring: el mensaje de control puede quedar pre-entregado incluso mientras se procesa un mensaje de INPUT. En carga nominal, cuando se ACKea el dato en curso, el evento del ring suele procesarse en el siguiente ciclo del event loop.
+
+Bajo sobrecarga sostenida de `INPUT_QUEUE` (datos llegando más rápido de lo que se procesan), puede aparecer un retraso mayor del ring. En ese caso el costo es de latencia, no de correctitud del protocolo.
 
 Lo que **no** garantiza es alternancia estricta 1-dato/1-ring. Si INPUT_QUEUE tiene muchos mensajes, el patrón típico es: procesar 1 dato (ACK) → pika procesa el ring pre-entregado (ACK) → RabbitMQ entrega el siguiente de INPUT y el siguiente del ring → repetir. En la práctica el ring se procesa dentro de 1-2 mensajes de datos de haber llegado, lo cual es suficiente para este diseño.
 
@@ -232,7 +234,14 @@ El gateway filtra resultados por `client_id` en `deserialize_result_message`, po
 
 ### Respecto a la cantidad de controles Sum
 
-Agregar más instancias de Sum distribuye la carga de datos de `INPUT_QUEUE` automáticamente (es una work queue). El protocolo del anillo escala linealmente: cada vuelta cuesta O(`SUM_AMOUNT`) mensajes de coordinación, independientemente del volumen de datos. El número de conexiones abiertas por Sum crece con `SUM_AMOUNT` (una por ring queue + una por aggregator) pero se trata de conexiones de publicación, no de consumo.
+Agregar más instancias de Sum distribuye la carga de datos de `INPUT_QUEUE` automáticamente (es una work queue). El protocolo del anillo escala linealmente: cada vuelta cuesta O(`SUM_AMOUNT`) mensajes de coordinación, independientemente del volumen de datos.
+
+En cada instancia de Sum, las conexiones abiertas son O(AGGREGATION_AMOUNT): 
+- una conexión para INPUT_QUEUE (que además registra el consumer del ring inbox)
+- una conexión para publicar al siguiente del anillo
+- AGGREGATION_AMOUNT conexiones de salida hacia Aggregation. 
+
+Lo que sí crece con SUM_AMOUNT es la cantidad de colas del anillo declaradas y el tráfico de coordinación, no la cantidad de conexiones por instancia.
 
 ### Respecto a la cantidad de controles Aggregation
 
@@ -273,4 +282,4 @@ La variante mantiene el mismo mecanismo de conteo que la solución elegida, pero
 
 La idea era incluir en el `eof` un conjunto de IDs de instancias que ya lo procesaron. Cada instancia que lo recibe agrega su propio ID y lo reencola en `INPUT_QUEUE`, a menos que el conjunto ya contenga todos los IDs. La instancia que cierra el conjunto sabe que es la última y no reencola.
 
-**Por qué no la usé**: `INPUT_QUEUE` es una work queue competitiva — RabbitMQ entrega el mensaje al primer consumer listo, sin garantía de equidad entre instancias. Una instancia rápida puede consumir el `eof` rereencolado repetidamente antes de que una instancia más lenta o ocupada tenga la oportunidad de verlo. Con N instancias, las mismas N-1 podrían consumir el `eof` en loop indefinidamente sin que la restante lo reciba nunca. El protocolo no tiene liveness garantizada.
+**Por qué no la usé**: `INPUT_QUEUE` es una work queue competitiva — RabbitMQ entrega el mensaje al primer consumer listo, sin garantía de equidad entre instancias. Una instancia rápida puede consumir el `eof` reencolado repetidamente antes de que una instancia más lenta o ocupada tenga la oportunidad de verlo. Con N instancias, las mismas N-1 podrían consumir el `eof` en loop indefinidamente sin que la restante lo reciba nunca. El protocolo no tiene liveness garantizada.
