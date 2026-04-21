@@ -248,7 +248,6 @@ La idea era reencolar tantas copias del `eof` como instancias de Sum hay en `INP
 
 **Problema fundamental**: RabbitMQ no garantiza round-robin estricto. El reparto depende del prefetch, la velocidad de ACK y el estado interno del broker. Con carga despareja, una instancia podría recibir dos copias y otra ninguna. El protocolo no tendría forma de detectarlo: dos flushes desde la misma instancia generarían doble conteo en Aggregation, y la instancia que no recibió el EOF nunca flushearía. El esquema falla de forma silenciosa y no determinística.
 
-
 ### 2. Canal compartido con `global=True` + fanout de EOF
 
 Cada Sum consume de dos colas en el mismo canal: `INPUT_QUEUE` (datos y `eof_request`) y una cola personal durable bindeada a un fanout exchange de control (`{SUM_PREFIX}_eof_{ID}`). El canal se configura con `basic_qos(prefetch_count=1, global_qos=True)`, que da **1 crédito total al canal** en lugar de 1 por consumer (por instancia de Sum).
