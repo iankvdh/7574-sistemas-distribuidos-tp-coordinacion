@@ -54,6 +54,8 @@ El diseño parte de los siguientes supuestos:
 
 Bajo estos supuestos no hay doble conteo, no hay flushes incompletos y no se necesitan mecanismos de deduplicación.
 
+**Consecuencias de los supuestos sobre limpieza de estado**: si un cliente se desconectara a mitad de sesión (sin enviar EOF), la entrada en `sessions` quedaría huérfana indefinidamente en todos los componentes. No se implementó un mecanismo de TTL ni de limpieza de clientes muertos porque el supuesto es que eso no ocurre. En un sistema sin ese supuesto sería necesario agregar un heartbeat del cliente o un timeout por inactividad para liberar la memoria asociada a sesiones abandonadas.
+
 ---
 
 ## 2. Protocolo interno de mensajes
@@ -93,6 +95,8 @@ Elegí backoff exponencial sobre reintentos a intervalo fijo porque reduce la ca
 ### Durabilidad
 
 Todas las colas se declaran con `durable=True` y los mensajes se publican con `delivery_mode=2`. Esto garantiza que si RabbitMQ se reinicia, las colas y sus mensajes sobreviven. Bajo los supuestos del TP esto no debería ocurrir, pero lo mantuve porque no agrega complejidad de código ya que fue realizado para el TP anterior, aunque reconozco que no se aprovecha de la mejor forma en esta implementación.
+
+No se usan **quorum queues**: son colas replicadas vía Raft que requieren un cluster de al menos 3 nodos de RabbitMQ para dar garantías reales. El sistema corre con un único nodo de RabbitMQ, por lo que en un nodo solo añadirían overhead de consenso sin ningún beneficio de replicación.
 
 ### Manejo de errores en ejecución
 
@@ -171,10 +175,14 @@ El mensaje `sum_done` se envía a **todos** los aggregators, para que cada uno s
 
 ### SIGTERM
 
-El handler de SIGTERM llama a `input_queue.stop_consuming()`, que detiene el event loop de pika (incluyendo el consumer del ring, ya que comparten channel). `start_consuming()` retorna y el bloque `finally` cierra todas las conexiones abiertas:
+El handler de SIGTERM activa el flag `_shutdown_requested` y llama a `input_queue.stop_consuming()`. El flag cubre el caso en que la señal llega antes de que empiece el loop: como `stop_consuming()` ahí no hace nada, luego se chequea el flag y se evita entrar a `start_consuming()`.
+
+`start_consuming()` retorna y el bloque `finally` cierra todas las conexiones abiertas:
 - `input_queue`: la conexión de INPUT_QUEUE (que también hostea el consumer del ring inbox).
 - `aggregator_queues[i]`: una conexión por cada aggregator (usadas para publicar `sum_partial` y `sum_done`).
 - `next_ring_queue`: conexión de ring, usada para publicar al nodo siguiente. Las demás ring queues se declararon en el channel de `input_queue` sin abrir conexiones propias.
+
+**Excepción no cubierta**: si una excepción ocurre durante el flush (dentro de `_flush()`), el mensaje `ring_finish` que lo disparó queda sin ACK. RabbitMQ lo reentregará al restartar el consumer, pero bajo el supuesto de que no hay caídas durante la ejecución esto no ocurre. No se implementó un flush idempotente ni deduplicación de `sum_partial` porque excede los supuestos del TP.
 
 ---
 
@@ -192,7 +200,7 @@ Decidí que cada Aggregation tenga su propia cola directa (en lugar de un Exchan
 
 ### SIGTERM
 
-Igual que en Sum: el handler llama a `stop_consuming()`, el `finally` cierra `input_queue` y `output_queue`.
+Igual que en Sum: el handler activa `_shutdown_requested`, llama a `stop_consuming()`, y el flag es verificado antes de entrar al loop para cubrir la race condition. El `finally` cierra `input_queue` y `output_queue`.
 
 ---
 
@@ -210,7 +218,7 @@ Decidí que Join acumule y re-ordene los tops parciales (en lugar de confiar en 
 
 ### SIGTERM
 
-Igual que los anteriores.
+Igual que los anteriores: `_shutdown_requested` + `stop_consuming()` + verificación antes del loop.
 
 ---
 
@@ -238,97 +246,3 @@ Agregar más instancias de Aggregation reduce la cantidad de frutas que procesa 
 
 
 
-
-
-<br><br>
-<br><br>
-
-
-
----
-<br><br>
-# CONSIGNA:
-
-## Trabajo Práctico - Coordinación
-
-En este trabajo se busca familiarizar a los estudiantes con los desafíos de la coordinación del trabajo y el control de la complejidad en sistemas distribuidos. Para tal fin se provee un esqueleto de un sistema de control de stock de una verdulería y un conjunto de escenarios de creciente grado de complejidad y distribución que demandarán mayor sofisticación en la comunicación de las partes involucradas.
-
-### Ejecución
-
-`make up` : Inicia los contenedores del sistema y comienza a seguir los logs de todos ellos en un solo flujo de salida.
-
-`make down`:   Detiene los contenedores y libera los recursos asociados.
-
-`make logs`: Sigue los logs de todos los contenedores en un solo flujo de salida.
-
-`make test`: Inicia los contenedores del sistema, espera a que los clientes finalicen, compara los resultados con una ejecución serial y detiene los contenederes.
-
-`make switch`: Permite alternar rápidamente entre los archivos de docker compose de los distintos escenarios provistos.
-
-### Elementos del sistema objetivo
-
-![ ](./imgs/diagrama_de_robustez.jpg  "Diagrama de Robustez")
-
-*Fig. 2: Diagrama de Robustez*
-
-#### Client
-
-Lee un archivo de entrada y envía por TCP/IP pares (fruta, cantidad) al sistema.
-Cuando finaliza el envío de datos, aguarda un top de pares (fruta, cantidad) y vuelca el resultado en un archivo de salida csv.
-El criterio y tamaño del top dependen de la configuración del sistema. Por defecto se trata de un top 3 de frutas de acuerdo a la cantidad total almacenada.
-
-#### Gateway
-
-Es el punto de entrada y salida del sistema. Intercambia mensajes con los clientes y las colas internas utilizando distintos protocolos.
-
-#### Sum
- 
-Recibe pares  (fruta, cantidad) y aplica la función Suma de la clase `FruitItem`. Por defecto esa suma es la canónica para los números enteros, ej:
-
-`("manzana", 5) + ("manzana", 8) = ("manzana", 13)`
-
-Pero su implementación podría modificarse.
-Cuando se detecta el final de la ingesta de datos envía los pares (fruta, cantidad) totales a los Aggregators.
-
-#### Aggregator
-
-Consolida los datos de las distintas instancias de Sum.
-Cuando se detecta el final de la ingesta, se calcula un top parcial y se envía esa información al Joiner.
-
-#### Joiner
-
-Recibe tops parciales de las instancias del Aggregator.
-Cuando se detecta el final de la ingesta, se envía el top final hacia el gateway para ser entregado al cliente.
-
-### Limitaciones del esqueleto provisto
-
-La implementación base respeta la división de responsabilidades de los distintos controles y hace uso de la clase `FruitItem` como un elemento opaco, sin asumir la implementación de las funciones de Suma y Comparación.
-
-No obstante, esta implementación no cubre los objetivos buscados tal y como es presentada. Entre sus falencias puede destactarse que:
-
- - No se implementa la interfaz del middleware. 
- - No se dividen los flujos de datos de los clientes más allá del Gateway, por lo que no se es capaz de resolver múltiples consultas concurrentemente.
- - No se implementan mecanismos de sincronización que permitan escalar los controles Sum y Aggregator. En particular:
-   - Las instancias de Sum se dividen el trabajo, pero solo una de ellas recibe la notificación de finalización en la ingesta de datos.
-   - Las instancias de Sum realizan _broadcast_ a todas las instancias de Aggregator, en lugar de agrupar los datos por algún criterio y evitar procesamiento redundante.
-  - No se maneja la señal SIGTERM, con la salvedad de los clientes y el Gateway.
-
-### Condiciones de Entrega
-
-El código de este repositorio se agrupa en dos carpetas, una para Python y otra para Golang. Los estudiantes deberán elegir **sólo uno** de estos lenguajes y realizar una implementación que funcione correctamente ante cambios en la multiplicidad de los controles (archivo de docker compose), los archivos de entrada y las implementaciones de las funciones de Suma y Comparación del `FruitItem`.
-
-![ ](./imgs/mutabilidad.jpg  "Mutabilidad de Elementos")
-
-*Fig. 3: Elementos mutables e inmutables*
-
-A modo de referencia, en la *Figura 2* se marcan en tonos oscuros los elementos que los estudiantes no deben alterar y en tonos claros aquellos sobre los que tienen libertad de decisión.
-Al momento de la evaluación y ejecución de las pruebas se **descartarán** o **reemplazarán** :
-
-- Los archivos de entrada de la carpeta `datasets`.
-- El archivo docker compose principal y los de la carpeta `scenarios`.
-- Todos los archivos Dockerfile.
-- Todo el código del cliente.
-- Todo el código del gateway, salvo `message_handler`.
-- La implementación del protocolo de comunicación externo y `FruitItem`.
-
-Redactar un breve informe explicando el modo en que se coordinan las instancias de Sum y Aggregation, así como el modo en el que el sistema escala respecto a los clientes y a la cantidad de controles.

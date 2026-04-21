@@ -82,8 +82,20 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             ) from e
 
     def add_queue_consumer(self, queue_name, on_message_callback):
-        self._channel.queue_declare(queue=queue_name, durable=True)
-        self._extra_consumers.append((queue_name, on_message_callback))
+        try:
+            self._channel.queue_declare(queue=queue_name, durable=True)
+            self._extra_consumers.append((queue_name, on_message_callback))
+        except (
+            pika.exceptions.AMQPConnectionError,
+            pika.exceptions.StreamLostError,
+        ) as e:
+            raise MessageMiddlewareDisconnectedError(
+                f"Conexión perdida al registrar consumer en {queue_name}"
+            ) from e
+        except Exception as e:
+            raise MessageMiddlewareMessageError(
+                f"Error al registrar consumer en {queue_name}: {e}"
+            ) from e
 
     def start_consuming(self, on_message_callback):
         def make_wrapper(cb):

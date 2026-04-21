@@ -25,6 +25,7 @@ class JoinFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.sessions = {}
+        self._shutdown_requested = False
 
     def _get_session(self, client_id):
         if client_id not in self.sessions:
@@ -39,6 +40,7 @@ class JoinFilter:
                 fruit, fruit_item.FruitItem(fruit, 0)
             ) + fruit_item.FruitItem(fruit, int(amount))
         session["received"] += 1
+        logging.info(f"agg_top | cid={cid} | received={session['received']}/{AGGREGATION_AMOUNT}")
         if session["received"] < AGGREGATION_AMOUNT:
             return
 
@@ -71,6 +73,8 @@ class JoinFilter:
 
     def start(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
+        if self._shutdown_requested:
+            return
         try:
             self.input_queue.start_consuming(self._process_message)
         finally:
@@ -78,11 +82,14 @@ class JoinFilter:
             self.output_queue.close()
 
     def _handle_sigterm(self, signum, frame):
+        logging.info("sigterm | component=join")
+        self._shutdown_requested = True
         self.input_queue.stop_consuming()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
+    logging.info(f"starting | component=join | agg_amount={AGGREGATION_AMOUNT} | top_size={TOP_SIZE}")
     join_filter = JoinFilter()
     join_filter.start()
 

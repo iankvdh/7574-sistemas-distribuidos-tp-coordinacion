@@ -25,6 +25,7 @@ class AggregationFilter:
             MOM_HOST, OUTPUT_QUEUE
         )
         self.sessions = {}
+        self._shutdown_requested = False
 
     def _get_session(self, client_id):
         if client_id not in self.sessions:
@@ -43,6 +44,7 @@ class AggregationFilter:
         cid = msg["client_id"]
         session = self._get_session(cid)
         session["done_count"] += 1
+        logging.info(f"sum_done | cid={cid} | agg_id={ID} | done={session['done_count']}/{SUM_AMOUNT}")
         if session["done_count"] < SUM_AMOUNT:
             return
 
@@ -74,11 +76,13 @@ class AggregationFilter:
         elif kind == Kind.SUM_DONE:
             self._handle_sum_done(msg)
         else:
-            logging.warning("aggregation | unknown kind=%s", kind)
+            logging.warning(f"aggregation | unknown kind={kind}")
         ack()
 
     def start(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
+        if self._shutdown_requested:
+            return
         try:
             self.input_queue.start_consuming(self._process_message)
         finally:
@@ -86,11 +90,14 @@ class AggregationFilter:
             self.output_queue.close()
 
     def _handle_sigterm(self, signum, frame):
+        logging.info(f"sigterm | component=aggregation | id={ID}")
+        self._shutdown_requested = True
         self.input_queue.stop_consuming()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
+    logging.info(f"starting | component=aggregation | id={ID} | sum_amount={SUM_AMOUNT} | top_size={TOP_SIZE}")
     aggregation_filter = AggregationFilter()
     aggregation_filter.start()
     return 0
