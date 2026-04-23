@@ -162,9 +162,11 @@ Esto evita la pérdida de mensajes de control al arranque: si `Sum_i` envía un 
 
 ### Prefetch
 
-- `InputWorker` usa `prefetch_count=1`, Esto evita que una réplica acapare demasiados mensajes de la work queue y favorece reparto más equitativo.
+- `InputWorker` usa `prefetch_count=1`. Esto evita que una réplica acapare demasiados mensajes de la work queue y favorece un reparto más equitativo.
 
 - `RingWorker` consume una cola exclusiva de su instancia, por lo que no hay competencia con otras réplicas sobre esa cola.
+
+Como tuning opcional, si hiciera falta más throughput en la work queue, `prefetch_count` de `InputWorker` puede subirse gradualmente (`4`, `8`, `16`, ...) y validar el impacto con métricas de latencia/backlog.
 
 ### Supervisión, cierre y señalización de errores
 
