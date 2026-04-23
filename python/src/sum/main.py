@@ -1,226 +1,191 @@
 import os
-import zlib
+import multiprocessing
 import signal
 import logging
+from multiprocessing.connection import wait as wait_for_process_exit
 
-from common import middleware, message_protocol, fruit_item
+from sum import InputWorker, RingWorker
+from common import middleware
 
 ID = int(os.environ["ID"])
 MOM_HOST = os.environ["MOM_HOST"]
 INPUT_QUEUE = os.environ["INPUT_QUEUE"]
 SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
 SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
 AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
-AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
-
-Kind = message_protocol.internal.Kind
-
-
-def _aggregator_id(fruit):
-    return zlib.crc32(fruit.encode("utf-8")) % AGGREGATION_AMOUNT
+_WORKER_JOIN_TIMEOUT_SECONDS = float(os.getenv("SUM_WORKER_JOIN_TIMEOUT_SECONDS", "5"))
+_WORKER_KILL_TIMEOUT_SECONDS = float(os.getenv("SUM_WORKER_KILL_TIMEOUT_SECONDS", "2"))
 
 
 class SumFilter:
 
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
-        self.aggregator_queues = []
-
-        for i in range(AGGREGATION_AMOUNT):
-            self.aggregator_queues.append(
-                middleware.MessageMiddlewareQueueRabbitMQ(
-                    MOM_HOST, f"{AGGREGATION_PREFIX}_{i}"
-                )
-            )
-        for i in range(SUM_AMOUNT):
-            self.input_queue.declare_queue(f"{SUM_PREFIX}_ring_{i}")
-
-        self._ring_inbox_name = f"{SUM_PREFIX}_ring_{ID}"
-        self.next_ring_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, f"{SUM_PREFIX}_ring_{(ID + 1) % SUM_AMOUNT}"
-        )
-        self.sessions = {}
+        self._p_input = None
+        self._p_ring = None
         self._shutdown_requested = False
 
-    def _get_session(self, client_id):
-        if client_id not in self.sessions:
-            self.sessions[client_id] = {
-                "partial_by_fruit": {},
-                "count": 0,
-                "is_leader": False,
-                "total_messages": None,
-            }
-        return self.sessions[client_id]
+        tmp = None  # conexión temporal para declarar las colas antes de iniciar los workers.
+        try:
+            tmp = middleware.MessageMiddlewareQueueRabbitMQ(MOM_HOST, INPUT_QUEUE)
+            for i in range(SUM_AMOUNT):
+                tmp.declare_queue(f"{SUM_PREFIX}_ring_{i}")
+        finally:
+            if tmp:
+                tmp.close()
 
-    def _handle_data(self, msg):
-        cid = msg["client_id"]
-        fruit = msg["fruit"]
-        session = self._get_session(cid)
-        session["count"] += 1
-        session["partial_by_fruit"][fruit] = session["partial_by_fruit"].get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(msg["amount"]))
+        self._manager = multiprocessing.Manager()
+        self._meta_by_client = self._manager.dict()
+        self._partials_sum_by_client = self._manager.dict()
+        self._lock = self._manager.Lock()
 
-    def _handle_eof(self, msg):
-        cid = msg["client_id"]
-        session = self._get_session(cid)
-        session["is_leader"] = True
-        session["total_messages"] = msg["total_messages"]
-        self.next_ring_queue.send(
-            message_protocol.internal.serialize(
-                {
-                    "kind": Kind.RING_TOKEN,
-                    "client_id": cid,
-                    "accumulated_count": session["count"],
-                }
-            )
-        )
-        logging.info(
-            f"ring_token init | cid={cid} | sum_id={ID} | count={session['count']}"
+    def _workers(self):
+        return (
+            ("input_worker", self._p_input),
+            ("ring_worker", self._p_ring),
         )
 
-    def _handle_ring_token(self, msg):
-        cid = msg["client_id"]
-        session = self._get_session(cid)
-        accumulated = msg["accumulated_count"]
-        if not session["is_leader"]:
-            self.next_ring_queue.send(
-                message_protocol.internal.serialize(
-                    {
-                        "kind": Kind.RING_TOKEN,
-                        "client_id": cid,
-                        "accumulated_count": accumulated + session["count"],
-                    }
-                )
-            )
+    def _start_workers(self):
+        if self._shutdown_requested:
             return
 
-        total = accumulated
-        if total == session["total_messages"]:
-            self.next_ring_queue.send(
-                message_protocol.internal.serialize(
-                    {
-                        "kind": Kind.RING_FINISH,
-                        "client_id": cid,
-                    }
-                )
-            )
-            logging.info(f"ring_finish init | cid={cid} | sum_id={ID} | total={total}")
-        elif total < session["total_messages"]:
-            total_messages = session["total_messages"]
-            session["is_leader"] = False
-            session["total_messages"] = None
-            self.input_queue.send(
-                message_protocol.internal.serialize(
-                    {
-                        "kind": Kind.EOF,
-                        "client_id": cid,
-                        "total_messages": total_messages,
-                    }
-                )
-            )
-            logging.info(f"ring retry | cid={cid} | sum_id={ID} | got={total}")
-        else:
-            logging.error(f"ring invariant violated | cid={cid} | sum_id={ID} | got={total} > expected={session['total_messages']}")
-            raise RuntimeError(
-                f"ring invariant violated: accumulated {total} > total_messages {session['total_messages']}"
-            )
-
-    def _flush(self, cid):
-        session = self.sessions[cid]
-        for final_fruit_item in session["partial_by_fruit"].values():
-            aggregator_id = _aggregator_id(final_fruit_item.fruit)
-            self.aggregator_queues[aggregator_id].send(
-                message_protocol.internal.serialize(
-                    {
-                        "kind": Kind.SUM_PARTIAL,
-                        "client_id": cid,
-                        "fruit": final_fruit_item.fruit,
-                        "amount": final_fruit_item.amount,
-                    }
-                )
-            )
-        done_msg = message_protocol.internal.serialize(
-            {
-                "kind": Kind.SUM_DONE,
-                "client_id": cid,
-                "src_id": ID,
-            }
+        self._p_input = multiprocessing.Process(
+            target=_run_input_worker,
+            args=(self._meta_by_client, self._partials_sum_by_client, self._lock),
+            daemon=True,
         )
-        for q in self.aggregator_queues:
-            q.send(done_msg)
-        logging.info(
-            f"flush | cid={cid} | sum_id={ID} | frutas={len(session['partial_by_fruit'])}"
+        self._p_ring = multiprocessing.Process(
+            target=_run_ring_worker,
+            args=(self._meta_by_client, self._partials_sum_by_client, self._lock),
+            daemon=True,
         )
-        del self.sessions[cid]
 
-    def _handle_ring_finish(self, msg):
-        cid = msg["client_id"]
-        is_leader = self._get_session(cid).get("is_leader", False)
-        self._flush(cid)
-        if not is_leader:
-            self.next_ring_queue.send(
-                message_protocol.internal.serialize(
-                    {
-                        "kind": Kind.RING_FINISH,
-                        "client_id": cid,
-                    }
-                )
+        if self._shutdown_requested:
+            return
+
+        self._p_input.start()
+
+        if self._shutdown_requested:
+            self._p_input.terminate()
+            self._p_input.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
+            return
+
+        self._p_ring.start()
+
+    def _wait_until_a_worker_exits(self):
+        if self._shutdown_requested:
+            return
+
+        sentinel_to_process = {}
+        for worker_name, worker in self._workers():
+            if worker is None:
+                continue
+            sentinel_to_process[worker.sentinel] = (worker_name, worker)
+
+        if not sentinel_to_process:
+            return
+
+        ready_sentinels = wait_for_process_exit(list(sentinel_to_process.keys()))
+        for sentinel in ready_sentinels:
+            worker_name, worker = sentinel_to_process[sentinel]
+            worker.join(timeout=0)
+            logging.info(
+                f"{worker_name} stopped | sum_id={ID} | exitcode={worker.exitcode}"
             )
 
-    def _process_message(self, message, ack, nack):
-        msg = message_protocol.internal.deserialize(message)
-        kind = msg.get("kind")
-        if kind == Kind.DATA:
-            self._handle_data(msg)
-        elif kind == Kind.EOF:
-            self._handle_eof(msg)
-        else:
-            logging.warning(f"sum | unexpected kind on INPUT_QUEUE: {kind}")
-        ack()
+    def _stop_workers_and_collect_failures(self):
+        failures = []
 
-    def _process_ring_message(self, message, ack, nack):
-        msg = message_protocol.internal.deserialize(message)
-        kind = msg.get("kind")
-        if kind == Kind.RING_TOKEN:
-            self._handle_ring_token(msg)
-        elif kind == Kind.RING_FINISH:
-            self._handle_ring_finish(msg)
-        else:
-            logging.warning(f"sum | unexpected kind on ring queue: {kind}")
-        ack()
+        for worker_name, worker in self._workers():
+            if worker is None:
+                continue
+
+            if worker.is_alive():
+                logging.info(f"stopping {worker_name} | sum_id={ID}")
+                worker.terminate()
+
+            worker.join(timeout=_WORKER_JOIN_TIMEOUT_SECONDS)
+
+            if worker.is_alive():
+                logging.error(
+                    f"{worker_name} did not stop after "
+                    f"{_WORKER_JOIN_TIMEOUT_SECONDS}s | sum_id={ID}"
+                )
+                worker.kill()
+                worker.join(timeout=_WORKER_KILL_TIMEOUT_SECONDS)
+
+            if worker.is_alive():
+                failures.append(f"{worker_name} stuck after SIGKILL ({worker.pid})")
+                continue
+
+            exitcode = worker.exitcode
+            logging.info(f"{worker_name} exited | sum_id={ID} | exitcode={exitcode}")
+
+            if self._shutdown_requested:
+                if exitcode not in (0, -signal.SIGTERM):
+                    failures.append(
+                        f"{worker_name} exited unexpectedly during shutdown ({exitcode})"
+                    )
+            elif exitcode != 0:
+                failures.append(f"{worker_name} failed with exit code {exitcode}")
+
+        return failures
 
     def start(self):
         signal.signal(signal.SIGTERM, self._handle_sigterm)
-        if self._shutdown_requested:
-            return
+
+        failures = []
         try:
-            self.input_queue.add_queue_consumer(
-                self._ring_inbox_name, self._process_ring_message
-            )
-            self.input_queue.start_consuming(self._process_message)
+            if self._shutdown_requested:
+                return
+            self._start_workers()
+            self._wait_until_a_worker_exits()
         finally:
-            self.input_queue.close()
-            for q in self.aggregator_queues:
-                q.close()
-            self.next_ring_queue.close()
+            failures.extend(self._stop_workers_and_collect_failures())
+            self._manager.shutdown()
+
+        if failures:
+            raise RuntimeError(
+                "sum supervisor detected worker failures: " + "; ".join(failures)
+            )
 
     def _handle_sigterm(self, signum, frame):
         logging.info(f"sigterm | component=sum | id={ID}")
         self._shutdown_requested = True
-        self.input_queue.stop_consuming()
+
+        for _, worker in self._workers():
+            if not worker or not worker.is_alive():
+                continue
+            try:
+                worker.terminate()
+            except (ProcessLookupError, OSError, ValueError):
+                pass
+
+
+def _run_input_worker(meta_by_client, partials_by_client, lock):
+    logging.basicConfig(level=logging.INFO)
+    InputWorker(meta_by_client, partials_by_client, lock).run()
+
+
+def _run_ring_worker(meta_by_client, partials_by_client, lock):
+    logging.basicConfig(level=logging.INFO)
+    RingWorker(meta_by_client, partials_by_client, lock).run()
 
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    logging.info(f"starting | component=sum | id={ID} | sum_amount={SUM_AMOUNT} | agg_amount={AGGREGATION_AMOUNT}")
-    sum_filter = SumFilter()
-    sum_filter.start()
-    return 0
+    logging.info(
+        "starting | component=sum | "
+        f"id={ID} | sum_amount={SUM_AMOUNT} | agg_amount={AGGREGATION_AMOUNT}"
+    )
+
+    try:
+        sum_filter = SumFilter()
+        sum_filter.start()
+        return 0
+    except Exception as e:
+        logging.error(f"sum terminated with error | id={ID} | error={e}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
