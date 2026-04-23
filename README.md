@@ -35,7 +35,7 @@ Para resolver los tres problemas centrales del TP:
 
 - **Múltiples clientes concurrentes**: cada mensaje lleva un `client_id` único generado por el gateway. Todos los componentes mantienen estado separado por cliente.
 - **Coordinación de EOF entre réplicas de Sum**: el gateway cuenta exactamente cuántos mensajes `data` envió (`total_messages`) e incluye ese número en el `eof`. Las réplicas de Sum usan un **anillo de conteo**: la que recibe el `eof` circula un token sumando los counts de cada nodo; cuando la suma iguala `total_messages`, todas flushean. Si no alcanza, se reintenta.
-- **Distribución de carga hacia Aggregation**: Sum hace sharding determinístico usando una clave compuesta `(client_id, fruit)` hasheada con zlib.crc32 % AGGREGATION_AMOUNT- Esto asegura que cada combinación cliente-fruta vaya siempre al mismo Aggregator, evitando broadcast y procesamiento redundante, y distribuyendo mejor la carga entre aggregators.
+- **Distribución de carga hacia Aggregation**: Sum hace sharding determinístico usando una clave compuesta `(client_id, fruit)` hasheada como `zlib.crc32(...) % AGGREGATION_AMOUNT`. Esto asegura que cada combinación cliente-fruta vaya siempre al mismo Aggregator, evitando broadcast y procesamiento redundante, y distribuyendo mejor la carga entre aggregators.
 ---
 
 ## 1. Supuestos
@@ -208,8 +208,6 @@ Cuando `done_count == SUM_AMOUNT` (ya todos los Sum hicieron flush):
 1. Calcula top parcial con `heapq.nlargest(TOP_SIZE, session["fruits"].values())`. (respeta los operadores de `FruitItem`)
 2. Publica `agg_top` a Join.
 3. Elimina la sesión del cliente.
-
-Cuando `done_count` alcanza `SUM_AMOUNT`, sabe que todas las instancias de Sum hicieron flush para ese cliente. En ese momento calcula el top parcial de sus frutas (usando la comparación de `FruitItem`) y envía un mensaje `agg_top` con `src_id` hacia Join. Luego limpia la sesión.
 
 Decidí que cada Aggregation tenga su propia cola directa (en lugar de un Exchange con fanout) porque Sum ya hace el sharding: sabe exactamente a qué aggregator mandar cada fruta.
 
