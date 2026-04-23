@@ -96,7 +96,7 @@ class SumFilter:
         failures = []
 
         for worker_name, worker in self._workers():
-            if worker is None:
+            if worker is None or worker.pid is None:
                 continue
 
             if worker.is_alive():
@@ -140,8 +140,10 @@ class SumFilter:
             self._start_workers()
             self._wait_until_a_worker_exits()
         finally:
-            failures.extend(self._stop_workers_and_collect_failures())
-            self._manager.shutdown()
+            try:
+                failures.extend(self._stop_workers_and_collect_failures())
+            finally:
+                self._manager.shutdown()
 
         if failures:
             raise RuntimeError(

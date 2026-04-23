@@ -30,8 +30,9 @@ def _connect_with_retry(host):
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
-    def __init__(self, host, queue_name):
+    def __init__(self, host, queue_name, prefetch_count=1):
         self._queue_name = queue_name
+        self._prefetch_count = prefetch_count
         self._connection = None
         self._channel = None
         try:
@@ -94,7 +95,7 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             return wrapper
 
         try:
-            self._channel.basic_qos(prefetch_count=1)
+            self._channel.basic_qos(prefetch_count=self._prefetch_count)
             self._channel.basic_consume(
                 queue=self._queue_name,
                 on_message_callback=make_wrapper(on_message_callback),

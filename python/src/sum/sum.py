@@ -24,8 +24,9 @@ def _default_meta():
     }
 
 
-def _aggregator_id(fruit):
-    return zlib.crc32(fruit.encode("utf-8")) % AGGREGATION_AMOUNT
+def _aggregator_id(client_id, fruit):
+    shard_key = f"{client_id}\x1f{fruit}"
+    return zlib.crc32(shard_key.encode("utf-8")) % AGGREGATION_AMOUNT
 
 
 class InputWorker:
@@ -106,6 +107,8 @@ class InputWorker:
             self.next_ring_queue = middleware.MessageMiddlewareQueueRabbitMQ(
                 MOM_HOST, f"{SUM_PREFIX}_ring_{(ID + 1) % SUM_AMOUNT}"
             )
+            if self._shutdown_requested:
+                return
             self.input_queue.start_consuming(self._process_message)
         except Exception as e:
             logging.error(f"input_worker crashed | id={ID} | error={e}")
@@ -165,7 +168,7 @@ class RingWorker:
             )
             logging.info(f"ring_finish init | cid={cid} | sum_id={ID} | total={total}")
 
-        # faltó contar un mensaje, reencolo EOF para reiniciar el proceso.
+        ## faltó contar un mensaje, reencolo EOF para reiniciar el proceso.
         elif total < total_messages:
             with self._lock:
                 meta = dict(self._meta_by_client.get(cid, _default_meta()))
@@ -183,7 +186,7 @@ class RingWorker:
             )
             logging.info(f"ring retry | cid={cid} | sum_id={ID} | got={total}")
 
-        # se contó demás, hay un error en alguna parte del ring (esto no debería pasar jamas)
+        ## se contó demás, hay un error en alguna parte del ring (esto no debería pasar jamas)
         else:
             logging.error(
                 f"ring invariant violated | cid={cid} | sum_id={ID} | got={total} > expected={total_messages}"
@@ -204,7 +207,7 @@ class RingWorker:
                 del self._partials_sum_by_client[cid]
 
         for final_fruit_item in partial_by_fruit.values():
-            aggregator_id = _aggregator_id(final_fruit_item.fruit)
+            aggregator_id = _aggregator_id(cid, final_fruit_item.fruit)
             self.aggregator_queues[aggregator_id].send(
                 # le envío al aggregator que corresponda mis resultados para ese cliente.
                 message_protocol.internal.serialize(
@@ -265,7 +268,7 @@ class RingWorker:
             return
         try:
             self.ring_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-                MOM_HOST, f"{SUM_PREFIX}_ring_{ID}"
+                MOM_HOST, f"{SUM_PREFIX}_ring_{ID}", prefetch_count=0
             )
             self.next_ring_queue = middleware.MessageMiddlewareQueueRabbitMQ(
                 MOM_HOST, f"{SUM_PREFIX}_ring_{(ID + 1) % SUM_AMOUNT}"
@@ -279,6 +282,8 @@ class RingWorker:
                 )
                 for i in range(AGGREGATION_AMOUNT)
             ]
+            if self._shutdown_requested:
+                return
             self.ring_queue.start_consuming(self._process_ring_message)
         except Exception as e:
             logging.error(f"ring_worker crashed | id={ID} | error={e}")
