@@ -30,11 +30,11 @@ def _connect_with_retry(host):
 
 class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
 
-    def __init__(self, host, queue_name):
+    def __init__(self, host, queue_name, prefetch_count=1):
         self._queue_name = queue_name
+        self._prefetch_count = prefetch_count
         self._connection = None
         self._channel = None
-        self._extra_consumers = []
         try:
             self._connection = _connect_with_retry(host)
             self._channel = self._connection.channel()
@@ -81,22 +81,6 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
                 f"Error al declarar cola {queue_name}: {e}"
             ) from e
 
-    def add_queue_consumer(self, queue_name, on_message_callback):
-        try:
-            self._channel.queue_declare(queue=queue_name, durable=True)
-            self._extra_consumers.append((queue_name, on_message_callback))
-        except (
-            pika.exceptions.AMQPConnectionError,
-            pika.exceptions.StreamLostError,
-        ) as e:
-            raise MessageMiddlewareDisconnectedError(
-                f"Conexión perdida al registrar consumer en {queue_name}"
-            ) from e
-        except Exception as e:
-            raise MessageMiddlewareMessageError(
-                f"Error al registrar consumer en {queue_name}: {e}"
-            ) from e
-
     def start_consuming(self, on_message_callback):
         def make_wrapper(cb):
             def wrapper(ch, method, properties, body):
@@ -111,16 +95,11 @@ class MessageMiddlewareQueueRabbitMQ(MessageMiddlewareQueue):
             return wrapper
 
         try:
-            self._channel.basic_qos(prefetch_count=1)
+            self._channel.basic_qos(prefetch_count=self._prefetch_count)
             self._channel.basic_consume(
                 queue=self._queue_name,
                 on_message_callback=make_wrapper(on_message_callback),
             )
-            for extra_queue, extra_cb in self._extra_consumers:
-                self._channel.basic_consume(
-                    queue=extra_queue, 
-                    on_message_callback=make_wrapper(extra_cb)
-                )
             self._channel.start_consuming()
         except (
             pika.exceptions.AMQPConnectionError,

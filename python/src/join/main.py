@@ -1,6 +1,7 @@
 import os
 import signal
 import logging
+import heapq
 
 from common import middleware, message_protocol, fruit_item
 
@@ -44,8 +45,7 @@ class JoinFilter:
         if session["received"] < AGGREGATION_AMOUNT:
             return
 
-        sorted_items = sorted(session["items"].values())
-        top_fruits = reversed(sorted_items[-TOP_SIZE:])
+        top_fruits = heapq.nlargest(TOP_SIZE, session["items"].values())
         top = []
         for fruit_chunk in top_fruits:
             top.append([fruit_chunk.fruit, fruit_chunk.amount])
